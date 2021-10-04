@@ -1,0 +1,2273 @@
+diff --git a/.gitignore b/.gitignore
+index b164b7b..e4645db 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,5 @@
+ *.swp
+ riscv/
++
++build/
++firesim-riscv-tools-prebuilt-2.0/
+diff --git a/conf/linux64-defconfig b/conf/linux64-defconfig
+index a51553e..4c9c489 100644
+--- a/conf/linux64-defconfig
++++ b/conf/linux64-defconfig
+@@ -58,6 +58,7 @@ CONFIG_NO_HZ_COMMON=y
+ CONFIG_NO_HZ_IDLE=y
+ # CONFIG_NO_HZ is not set
+ CONFIG_HIGH_RES_TIMERS=y
++CONFIG_HZ=10
+ # end of Timers subsystem
+ 
+ CONFIG_PREEMPT_NONE=y
+diff --git a/conf/qemu_riscv64_virt_defconfig b/conf/qemu_riscv64_virt_defconfig
+index 13f51a1..32ff4fb 100644
+--- a/conf/qemu_riscv64_virt_defconfig
++++ b/conf/qemu_riscv64_virt_defconfig
+@@ -15,7 +15,7 @@ BR2_TOOLCHAIN_EXTERNAL_INET_RPC=y
+ BR2_TOOLCHAIN_EXTERNAL_CXX=y
+ 
+ # System
+-BR2_SYSTEM_DHCP="eth0"
++#BR2_SYSTEM_DHCP="eth0"
+ #BR2_TARGET_GENERIC_GETTY=y
+ #BR2_TARGET_GENERIC_GETTY_PORT="ttyS0"
+ BR2_TARGET_GENERIC_ROOT_PASSWD="sifive"
+@@ -44,4 +44,6 @@ BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_5_1=y
+ # BR2_PACKAGE_HOST_QEMU_SYSTEM_MODE=y
+ 
+ # Packages
+-BR2_PACKAGE_DROPBEAR=y
++#BR2_PACKAGE_DROPBEAR=y
++# BR2_PACKAGE_TMUX=y
++# BR2_PACKAGE_SCREEN=y
+Submodule linux contains untracked content
+Submodule linux contains modified content
+diff --git a/linux/arch/riscv/mm/init.c b/linux/arch/riscv/mm/init.c
+index 42bf939693d3..928d5d80f103 100644
+--- a/linux/arch/riscv/mm/init.c
++++ b/linux/arch/riscv/mm/init.c
+@@ -18,6 +18,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/io.h>
+ 
++#include <linux/dma-contiguous.h>
++
+ unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
+ 							__page_aligned_bss;
+ EXPORT_SYMBOL(empty_zero_page);
+@@ -444,4 +446,5 @@ void __init paging_init(void)
+ 	setup_vm_final();
+ 	setup_zero_page();
+ 	zone_sizes_init();
++	dma_contiguous_reserve(memblock_end_of_DRAM());
+ }
+Submodule linux-keystone-driver contains untracked content
+Submodule linux-keystone-driver contains modified content
+diff --git a/linux-keystone-driver/Makefile b/linux-keystone-driver/Makefile
+index 6135855..bc89251 100644
+--- a/linux-keystone-driver/Makefile
++++ b/linux-keystone-driver/Makefile
+@@ -11,10 +11,10 @@ ifneq ($(KERNELRELEASE),)
+ else
+ 
+ PWD := $(shell pwd)
+-KDIR := $(PWD)/../linux
++KDIR := $(PWD)/../build/linux.build
+ 
+ default:
+-	$(MAKE) -C $(KDIR) ARCH=riscv SUBDIRS=$(PWD) modules
++	$(MAKE) VERBOSE=1 CROSS_COMPILE=riscv64-unknown-linux-gnu- ARCH=riscv -C $(KDIR) ARCH=riscv M=$(PWD) modules
+ 
+ copy:
+ 	cp $(DRIVER) $(OVERLAY_DIR)
+diff --git a/linux-keystone-driver/keystone-enclave.c b/linux-keystone-driver/keystone-enclave.c
+index 61ff1ae..f6c4c5e 100644
+--- a/linux-keystone-driver/keystone-enclave.c
++++ b/linux-keystone-driver/keystone-enclave.c
+@@ -35,17 +35,27 @@ int destroy_enclave(struct enclave* enclave)
+ {
+   struct epm* epm;
+   struct utm* utm;
++  struct sem* sem;
++
++  // keystone_err("Destroying Enclave");
++
+   if (enclave == NULL)
+     return -ENOSYS;
+ 
+   epm = enclave->epm;
+   utm = enclave->utm;
++  sem = enclave->sem;
+ 
+   if (epm)
+   {
+     epm_destroy(epm);
+     kfree(epm);
+   }
++  if (sem)
++  {
++    sem_destroy(sem);
++    kfree(sem);
++  }
+   if (utm)
+   {
+     utm_destroy(utm);
+@@ -59,27 +69,40 @@ struct enclave* create_enclave(unsigned long min_pages)
+ {
+   struct enclave* enclave;
+ 
++  // keystone_err("Creating Enclave");
++
+   enclave = kmalloc(sizeof(struct enclave), GFP_KERNEL);
+   if (!enclave){
+     keystone_err("failed to allocate enclave struct\n");
+     goto error_no_free;
+   }
+-
+   enclave->utm = NULL;
++  enclave->sem = NULL;
+   enclave->close_on_pexit = 1;
+ 
+   enclave->epm = kmalloc(sizeof(struct epm), GFP_KERNEL);
+   enclave->is_init = true;
++
+   if (!enclave->epm)
+   {
+     keystone_err("failed to allocate epm\n");
+     goto error_destroy_enclave;
+   }
+-
+   if(epm_init(enclave->epm, min_pages)) {
+     keystone_err("failed to initialize epm\n");
+     goto error_destroy_enclave;
+   }
++
++  // enclave->sem = kmalloc(sizeof(struct sem), GFP_KERNEL);
++  // if (!enclave->sem)
++  // {
++  //   keystone_err("failed to allocate sem\n");
++  //   goto error_destroy_enclave;
++  // }
++  // if(sem_init(enclave->sem, 8)) {
++  //   keystone_err("failed to initialize sem\n");
++  //   goto error_destroy_enclave;
++  // }
+   return enclave;
+ 
+  error_destroy_enclave:
+diff --git a/linux-keystone-driver/keystone-ioctl.c b/linux-keystone-driver/keystone-ioctl.c
+index f5e8d9f..4ff46ba 100644
+--- a/linux-keystone-driver/keystone-ioctl.c
++++ b/linux-keystone-driver/keystone-ioctl.c
+@@ -7,6 +7,102 @@
+ #include "keystone_user.h"
+ #include <linux/uaccess.h>
+ 
++#include "print.h"
++void print_runtime_params(const struct runtime_params_t p)
++{
++  keystone_err("runtime parameters:\r\n"
++    "\truntime entry:  %llx\r\n"
++    "\tuser_entry:     %llx\r\n"
++    "\tuntrusted_ptr:  %llx\r\n"
++    "\tuntrusted_size: %llx\r\n"
++    "\tshared_entry:   %llx\r\n"
++    "\tshared_size:    %llx",
++    p.runtime_entry, p.user_entry, p.untrusted_ptr,
++    p.untrusted_size, p.shared_entry, p.shared_size);
++}
++
++void print_params(const struct keystone_ioctl_create_enclave * const params) {
++  // virtual addresses
++  keystone_err("virtual_addresses\r\n"
++    "\truntime_vaddr: %llx\r\n"
++    "\tuser_vaddr:    %llx\r\n"
++    "\tutm_free_ptr:  %llx\r\n"
++    "\tpt_ptr:        %llx\r\n", 
++    params->runtime_vaddr, params->user_vaddr, params->utm_free_ptr, params->pt_ptr);
++
++  // runtime params
++  print_runtime_params(params->params);
++
++  keystone_err("physical addresses:\r\n"
++    "\tepm_paddr:     %llx\r\n"
++    "\tutm_paddr:     %llx\r\n"
++    "\truntime_paddr: %llx\r\n"
++    "\tuser_paddr     %llx\r\n"
++    "\tfree_paddr:    %llx",
++    params->epm_paddr, params->utm_paddr, params->runtime_paddr, 
++    params->user_paddr, params->free_paddr);
++}
++
++void print_sbi_pregion(struct keystone_sbi_pregion_t *reg)
++{
++  // keystone_err("\t\tsbi_pregion: { paddr=%llx, size=%d }", reg->paddr, reg->size);
++  keystone_err("\t\tsbi_pregion: { paddr=%lx-%lx, size=%ld }", 
++    reg->paddr, reg->paddr+reg->size, reg->size);
++}
++
++void print_keystone_sbi_param(struct keystone_sbi_create_t *create_args)
++{
++  keystone_err("Printing parameters passed to SM:", 0);
++
++  keystone_err("\tepm_region:");
++  print_sbi_pregion(&create_args->epm_region);
++  keystone_err("\tutm_region:");
++  print_sbi_pregion(&create_args->utm_region);
++  keystone_err("\tsem_region:");
++  print_sbi_pregion(&create_args->sem_region);
++
++  keystone_err("\truntime_paddr = %lx", create_args->runtime_paddr);
++  keystone_err("\tuser_paddr =    %lx", create_args->user_paddr);
++  keystone_err("\tfree_paddr =    %lx", create_args->free_paddr);
++
++  print_runtime_params(create_args->params);
++
++  keystone_err("\teid_pptr = %d", create_args->eid_pptr);
++}
++
++void print_enclave(struct enclave* enclave) {
++  keystone_err("Printing enclave struct:\r\n\teid: %ld\r\n"
++    "\tclose_on_pexit: %d\r\n\tis_init: %d", 
++    enclave->eid, enclave->close_on_pexit, enclave->is_init);
++  if(enclave->sem)
++    keystone_err("\tsem:\r\n"
++      "\t\troot_pt: %llx\r\n"
++      "\t\tptr:     %lx\r\n"
++      "\t\tsize:    %ld\r\n"
++      "\t\torder:   %ld",
++      (unsigned long long) enclave->sem->root_page_table, enclave->sem->ptr, 
++      enclave->sem->size, enclave->sem->order);
++  if(enclave->utm)
++    keystone_err("\tutm:\r\n"
++      "\t\troot_pt: %llx\r\n"
++      "\t\tptr:     %p\r\n"
++      "\t\tsize:    %ld\r\n"
++      "\t\torder:   %ld",
++      (unsigned long long) enclave->utm->root_page_table, enclave->utm->ptr, 
++      enclave->utm->size, enclave->utm->order);
++  if(enclave->epm)
++    keystone_err("\tepm:\r\n"
++      "\t\troot_pt: %llx\r\n"
++      "\t\tptr:     %lx\r\n"
++      "\t\tsize:    %ld\r\n"
++      "\t\torder:   %ld\r\n"
++      "\t\tpa:      %lx\r\n"
++      "\t\tis_cma:  %d",
++      (unsigned long long) enclave->epm->root_page_table, enclave->epm->ptr, 
++      enclave->epm->size, enclave->epm->order,
++      enclave->epm->pa, enclave->epm->is_cma);
++}
++
+ int __keystone_destroy_enclave(unsigned int ueid);
+ 
+ int keystone_create_enclave(struct file *filep, unsigned long arg)
+@@ -15,7 +111,13 @@ int keystone_create_enclave(struct file *filep, unsigned long arg)
+   struct keystone_ioctl_create_enclave *enclp = (struct keystone_ioctl_create_enclave *) arg;
+ 
+   struct enclave *enclave;
++
++  // keystone_err("keystone_create_enclave");
++
++  // print_params(enclp);
++
+   enclave = create_enclave(enclp->min_pages);
++  // print_enclave(enclave);
+ 
+   if (enclave == NULL) {
+     return -ENOMEM;
+@@ -30,10 +132,12 @@ int keystone_create_enclave(struct file *filep, unsigned long arg)
+ 
+   filep->private_data = (void *) enclp->eid;
+ 
++  // keystone_err("after creation");
++  // print_params(enclp);
++
+   return 0;
+ }
+ 
+-
+ int keystone_finalize_enclave(unsigned long arg)
+ {
+   int ret;
+@@ -43,9 +147,13 @@ int keystone_finalize_enclave(unsigned long arg)
+ 
+   struct keystone_ioctl_create_enclave *enclp = (struct keystone_ioctl_create_enclave *) arg;
+ 
++  // keystone_err("keystone_finalize_enclave");
++  // print_params(enclp);
++
+   enclave = get_enclave_by_id(enclp->eid);
++  // print_enclave(enclave);
+   if(!enclave) {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 1\n");
+     return -EINVAL;
+   }
+ 
+@@ -65,6 +173,21 @@ int keystone_finalize_enclave(unsigned long arg)
+     create_args.utm_region.size = 0;
+   }
+ 
++  if(enclave->sem) {
++    create_args.sem_region.paddr = __pa(enclave->sem->ptr);
++    create_args.sem_region.size = enclave->sem->size;
++  } else {
++    create_args.sem_region.paddr = 0;
++    create_args.sem_region.size = 0;
++  }
++
++  // if (enclave->sem)
++  //   keystone_err("sem:\r\n\tsem_ptr: %llx\r\n\tsem_size: %llx\r\n",
++  //           enclave->sem->ptr, enclave->sem->size);
++  // if(enclave->utm)
++  //   keystone_err("utm:\r\n\tutm_ptr: %llx\r\n\tutm_size: %llx\r\n",
++  //            enclave->utm->ptr, enclave->utm->size);
++
+   // physical addresses for runtime, user, and freemem
+   create_args.runtime_paddr = enclp->runtime_paddr;
+   create_args.user_paddr = enclp->user_paddr;
+@@ -75,6 +198,10 @@ int keystone_finalize_enclave(unsigned long arg)
+   // SM will write the eid to struct enclave.eid
+   create_args.eid_pptr = (unsigned int *) __pa(&enclave->eid);
+ 
++  // keystone_err("Enclave created in linux land. Passing to the SM...");
++  // print_keystone_sbi_param(&create_args);
++  // print_enclave(enclave);
++
+   ret = SBI_CALL_1(SBI_SM_CREATE_ENCLAVE, __pa(&create_args));
+   if (ret) {
+     keystone_err("keystone_create_enclave: SBI call failed\n");
+@@ -98,11 +225,13 @@ int keystone_run_enclave(unsigned long arg)
+   struct enclave* enclave;
+   struct keystone_ioctl_run_enclave *run = (struct keystone_ioctl_run_enclave*) arg;
+ 
++  // keystone_err("keystone_run_enclave");
++
+   ueid = run->eid;
+   enclave = get_enclave_by_id(ueid);
+ 
+   if(!enclave) {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 2\n");
+     return -EINVAL;
+   }
+ 
+@@ -119,10 +248,14 @@ int utm_init_ioctl(struct file *filp, unsigned long arg)
+   struct keystone_ioctl_create_enclave *enclp = (struct keystone_ioctl_create_enclave *) arg;
+   long long unsigned untrusted_size = enclp->params.untrusted_size;
+ 
++  // keystone_err("utm_init_ioctl");
++  // print_params(enclp);
++
+   enclave = get_enclave_by_id(enclp->eid);
++  // print_enclave(enclave);
+ 
+   if(!enclave) {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 3\n");
+     return -EINVAL;
+   }
+ 
+@@ -139,9 +272,49 @@ int utm_init_ioctl(struct file *filp, unsigned long arg)
+ 
+   enclp->utm_free_ptr = __pa(utm->ptr);
+ 
++  // print_params(enclp);
++  // print_enclave(enclave);
++
+   return ret;
+ }
+ 
++int sem_init_ioctl(struct file *filp, unsigned long arg)
++{
++  int ret = 0;
++  struct sem *sem;
++  struct enclave *enclave;
++  struct keystone_ioctl_create_enclave *enclp = (struct keystone_ioctl_create_enclave *) arg;
++  long long unsigned untrusted_size = enclp->params.shared_size;
++
++  // keystone_err("sem_init_ioctl");
++  // print_params(enclp);
++
++  enclave = get_enclave_by_id(enclp->eid);
++  // print_enclave(enclave);
++
++  if(!enclave) {
++    keystone_err("invalid enclave id 4\n");
++    return -EINVAL;
++  }
++
++  sem = kmalloc(sizeof(struct sem), GFP_KERNEL);
++  if (!sem) {
++    ret = -ENOMEM;
++    return ret;
++  }
++
++  ret = sem_init(sem, untrusted_size);
++
++  // print_params(enclp);
++  // print_enclave(enclave);
++
++  /* prepare for mmap */
++  enclave->sem = sem;
++
++  enclp->sem_free_ptr = __pa(sem->ptr);
++
++  return ret;
++}
+ 
+ int keystone_destroy_enclave(struct file *filep, unsigned long arg)
+ {
+@@ -149,6 +322,9 @@ int keystone_destroy_enclave(struct file *filep, unsigned long arg)
+   struct keystone_ioctl_create_enclave *enclp = (struct keystone_ioctl_create_enclave *) arg;
+   unsigned long ueid = enclp->eid;
+ 
++  // keystone_err("keystone_destroy_enclave");
++  // print_params(enclp);
++
+   ret = __keystone_destroy_enclave(ueid);
+   if (!ret) {
+     filep->private_data = NULL;
+@@ -163,7 +339,7 @@ int __keystone_destroy_enclave(unsigned int ueid)
+   enclave = get_enclave_by_id(ueid);
+ 
+   if (!enclave) {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 5\n");
+     return -EINVAL;
+   }
+   ret = SBI_CALL_1(SBI_SM_DESTROY_ENCLAVE, enclave->eid);
+@@ -184,11 +360,14 @@ int keystone_resume_enclave(unsigned long arg)
+   struct keystone_ioctl_run_enclave *resume = (struct keystone_ioctl_run_enclave*) arg;
+   unsigned long ueid = resume->eid;
+   struct enclave* enclave;
++
++  // keystone_err("keystone_resume_enclave");
++
+   enclave = get_enclave_by_id(ueid);
+ 
+   if (!enclave)
+   {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 6\n");
+     return -EINVAL;
+   }
+ 
+@@ -197,6 +376,37 @@ int keystone_resume_enclave(unsigned long arg)
+   return ret;
+ }
+ 
++int keystone_connect_enclave(unsigned long arg)
++{
++  int ret = 0;
++  struct keystone_ioctl_con_enclave *encls = (struct keystone_ioctl_con_enclave*) arg;
++  unsigned long ueid1 = encls->eid1;
++  unsigned long ueid2 = encls->eid2;
++  struct enclave* enclave1;
++  struct enclave* enclave2;
++
++  // keystone_err("keystone_connect_enclave");
++
++  // keystone_err("Recieved ueid1: %d, uedi2: %d", ueid1, ueid2);
++
++  enclave1 = get_enclave_by_id(ueid1);
++  enclave2 = get_enclave_by_id(ueid2);
++
++  // keystone_err("enclave1: user space eid: %d, kernel space eid: %d", ueid1, enclave1->eid);
++  // keystone_err("enclave2: user space eid: %d, kernel space eid: %d", ueid2, enclave2->eid);
++
++  if (!enclave1 || !enclave2)
++  {
++    keystone_err("invalid enclave id\n");
++    return -EINVAL;
++  }
++
++  // keystone_err("SBI_CALL_2");
++  ret = SBI_CALL_2(SBI_SM_CON_ENCLAVEs, enclave1->eid, enclave2->eid);
++
++  return ret;
++}
++
+ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ {
+   long ret;
+@@ -204,6 +414,8 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ 
+   size_t ioc_size;
+ 
++  // keystone_err("keystone_ioctl: %x", cmd);
++
+   if (!arg)
+     return -EINVAL;
+ 
+@@ -236,6 +448,12 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+     case KEYSTONE_IOC_UTM_INIT:
+       ret = utm_init_ioctl(filep, (unsigned long) data);
+       break;
++    case KEYSTONE_IOC_SEM_INIT:
++      ret = sem_init_ioctl(filep, (unsigned long) data);
++      break;
++    case KEYSTONE_IOC_CON_ENCLAVES:
++      ret = keystone_connect_enclave((unsigned long) data);
++      break;
+     default:
+       return -ENOSYS;
+   }
+@@ -248,8 +466,9 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ 
+ int keystone_release(struct inode *inode, struct file *file) {
+   unsigned long ueid = (unsigned long)(file->private_data);
++  struct enclave *enclave;
+ 
+-  /* pr_info("Releasing enclave: %d\n", ueid); */
++  // keystone_err("Releasing enclave: %lu\n", ueid);
+ 
+   /* enclave has been already destroyed */
+   if (!ueid) {
+@@ -257,7 +476,7 @@ int keystone_release(struct inode *inode, struct file *file) {
+   }
+ 
+   /* We need to send destroy enclave just the eid to close. */
+-    struct enclave *enclave = get_enclave_by_id(ueid);
++  enclave = get_enclave_by_id(ueid);
+ 
+   if (!enclave) {
+     /* If eid is set to the invalid id, then we do not do anything. */
+diff --git a/linux-keystone-driver/keystone-page.c b/linux-keystone-driver/keystone-page.c
+index 9c084a9..b360996 100644
+--- a/linux-keystone-driver/keystone-page.c
++++ b/linux-keystone-driver/keystone-page.c
+@@ -111,3 +111,41 @@ int utm_init(struct utm* utm, size_t untrusted_size)
+ 
+   return 0;
+ }
++
++/* Destroy all memory associated with an SEM */
++int sem_destroy(struct sem* sem) {
++
++  if(sem->ptr != NULL){
++    free_pages((vaddr_t)sem->ptr, sem->order);
++  }
++
++  return 0;
++}
++
++/* Create an shared enclave buffer */
++int sem_init(struct sem* sem, size_t size)
++{
++  unsigned long req_pages = 0;
++  unsigned long order = 0;
++  unsigned long count;
++  req_pages += PAGE_UP(size)/PAGE_SIZE;
++  order = ilog2(req_pages - 1) + 1;
++  count = 0x1 << order;
++
++  sem->order = order;
++
++  /* Currently, SEM does not utilize CMA.
++   * It is always allocated from the buddy allocator */
++  sem->ptr = (void*) __get_free_pages(GFP_HIGHUSER, order);
++  if (!sem->ptr) {
++    return -ENOMEM;
++  }
++
++  sem->size = count * PAGE_SIZE;
++  if (sem->size != size) {
++    /* Instead of failing, we just warn that the user has to fix the parameter. */
++    keystone_warn("shared buffer size is not multiple of PAGE_SIZE\n");
++  }
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/linux-keystone-driver/keystone-sbi-arg.h b/linux-keystone-driver/keystone-sbi-arg.h
+index 5369129..84de6e8 100644
+--- a/linux-keystone-driver/keystone-sbi-arg.h
++++ b/linux-keystone-driver/keystone-sbi-arg.h
+@@ -16,8 +16,9 @@ struct keystone_sbi_pregion_t
+ struct keystone_sbi_create_t
+ {
+   // Memory regions for the enclave
+-  struct keystone_sbi_pregion_t epm_region;
+-  struct keystone_sbi_pregion_t utm_region;
++  struct keystone_sbi_pregion_t epm_region; // enclave private memory
++  struct keystone_sbi_pregion_t utm_region; // untrusted shared memory (enclave <-> app)
++  struct keystone_sbi_pregion_t sem_region; // shared enclave memory (enclave <-> enclave)
+ 
+   // physical addresses
+   uintptr_t runtime_paddr;
+diff --git a/linux-keystone-driver/keystone.c b/linux-keystone-driver/keystone.c
+index bc1bc09..5de9361 100644
+--- a/linux-keystone-driver/keystone.c
++++ b/linux-keystone-driver/keystone.c
+@@ -36,6 +36,8 @@ struct miscdevice keystone_dev = {
+   .mode = 0666,
+ };
+ 
++#include "print.h"
++
+ int keystone_mmap(struct file* filp, struct vm_area_struct *vma)
+ {
+   struct utm* utm;
+@@ -45,7 +47,7 @@ int keystone_mmap(struct file* filp, struct vm_area_struct *vma)
+   vaddr_t paddr;
+   enclave = get_enclave_by_id((unsigned long) filp->private_data);
+   if(!enclave) {
+-    keystone_err("invalid enclave id\n");
++    keystone_err("invalid enclave id 7\n");
+     return -EINVAL;
+   }
+ 
+@@ -83,7 +85,7 @@ static int __init keystone_dev_init(void)
+   ret = misc_register(&keystone_dev);
+   if (ret < 0)
+   {
+-    pr_err("keystone_enclave: misc_register() failed\n");
++    keystone_err("keystone_enclave: misc_register() failed\n");
+   }
+ 
+   keystone_dev.this_device->coherent_dma_mask = DMA_BIT_MASK(32);
+diff --git a/linux-keystone-driver/keystone.h b/linux-keystone-driver/keystone.h
+index b959539..76e2256 100644
+--- a/linux-keystone-driver/keystone.h
++++ b/linux-keystone-driver/keystone.h
+@@ -19,6 +19,10 @@
+ 
+ #include <linux/file.h>
+ 
++// typedef __u64 uintptr_t;
++// typedef __u64 size_t;
++// typedef char bool;
++
+ /* IMPORTANT: This code assumes Sv39 */
+ #include "riscv64.h"
+ 
+@@ -31,6 +35,7 @@ extern struct miscdevice keystone_dev;
+ #define SBI_SM_RUN_ENCLAVE      105
+ #define SBI_SM_STOP_ENCLAVE     106
+ #define SBI_SM_RESUME_ENCLAVE   107
++#define SBI_SM_CON_ENCLAVEs     109
+ 
+ /* error codes: need to add more */
+ #define ENCLAVE_INTERRUPTED     2
+@@ -70,6 +75,13 @@ struct epm {
+   bool is_cma;
+ };
+ 
++struct sem {
++  pte_t* root_page_table;
++  vaddr_t ptr;
++  size_t size;
++  unsigned long order;
++};
++
+ struct utm {
+   pte_t* root_page_table;
+   void* ptr;
+@@ -84,6 +96,7 @@ struct enclave
+   int close_on_pexit;
+   struct utm* utm;
+   struct epm* epm;
++  struct sem* sem;
+   bool is_init;
+ };
+ 
+@@ -113,6 +126,8 @@ static inline uintptr_t  epm_satp(struct epm* epm) {
+ 
+ int epm_destroy(struct epm* epm);
+ int epm_init(struct epm* epm, unsigned int count);
++int sem_destroy(struct sem* sem);
++int sem_init(struct sem* sem, size_t size);
+ int utm_destroy(struct utm* utm);
+ int utm_init(struct utm* utm, size_t untrusted_size);
+ paddr_t epm_va_to_pa(struct epm* epm, vaddr_t addr);
+diff --git a/linux-keystone-driver/keystone_user.h b/linux-keystone-driver/keystone_user.h
+index 57cf384..7a2ab0d 100644
+--- a/linux-keystone-driver/keystone_user.h
++++ b/linux-keystone-driver/keystone_user.h
+@@ -23,19 +23,27 @@
+   _IOR(KEYSTONE_IOC_MAGIC, 0x06, struct keystone_ioctl_create_enclave)
+ #define KEYSTONE_IOC_UTM_INIT \
+   _IOR(KEYSTONE_IOC_MAGIC, 0x07, struct keystone_ioctl_create_enclave)
++#define KEYSTONE_IOC_SEM_INIT \
++  _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_create_enclave)
++#define KEYSTONE_IOC_CON_ENCLAVES \
++  _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_con_enclave)
+ 
+ #define RT_NOEXEC 0
+ #define USER_NOEXEC 1
+ #define RT_FULL 2
+ #define USER_FULL 3
+ #define UTM_FULL 4
++#define SEM_FULL 5
+ 
++#define MDSIZE 64
+ 
+ struct runtime_params_t {
+   __u64 runtime_entry;
+   __u64 user_entry;
+   __u64 untrusted_ptr;
+   __u64 untrusted_size;
++  __u64 shared_entry;
++  __u64 shared_size;
+ };
+ 
+ struct keystone_ioctl_create_enclave {
+@@ -50,6 +58,7 @@ struct keystone_ioctl_create_enclave {
+ 
+   __u64 pt_ptr;
+   __u64 utm_free_ptr;
++  __u64 sem_free_ptr;
+ 
+   //Used for hash
+   __u64 epm_paddr;
+@@ -65,6 +74,11 @@ struct keystone_ioctl_create_enclave {
+   struct runtime_params_t params;
+ };
+ 
++struct keystone_ioctl_con_enclave {
++  __u64 eid1;
++  __u64 eid2;
++};
++
+ struct keystone_ioctl_run_enclave {
+   __u64 eid;
+   __u64 entry;
+Submodule qemu contains untracked content
+Submodule qemu contains modified content
+diff --git a/qemu/hw/riscv/virt.c b/qemu/hw/riscv/virt.c
+index 25faf3b417..47bff37d27 100644
+--- a/qemu/hw/riscv/virt.c
++++ b/qemu/hw/riscv/virt.c
+@@ -55,7 +55,7 @@ static const struct MemmapEntry {
+     hwaddr size;
+ } virt_memmap[] = {
+     [VIRT_DEBUG] =       {        0x0,         0x100 },
+-    [VIRT_MROM] =        {     0x1000,       0x11000 },
++    [VIRT_MROM] =        {     0x1000,       0x40000 },
+     [VIRT_TEST] =        {   0x100000,        0x1000 },
+     [VIRT_CLINT] =       {  0x2000000,       0x10000 },
+     [VIRT_PLIC] =        {  0xc000000,     0x4000000 },
+@@ -405,8 +405,8 @@ static void riscv_virt_board_init(MachineState *machine)
+     memory_region_add_subregion(system_memory, memmap[VIRT_MROM].base,
+                                 mask_rom);
+ 
+-    riscv_find_and_load_firmware(machine, BIOS_FILENAME,
+-                                 memmap[VIRT_DRAM].base);
++    //riscv_find_and_load_firmware(machine, BIOS_FILENAME,
++    //                             memmap[VIRT_DRAM].base);
+ 
+     if (machine->kernel_filename) {
+         uint64_t kernel_entry = riscv_load_kernel(machine->kernel_filename);
+@@ -423,6 +423,50 @@ static void riscv_virt_board_init(MachineState *machine)
+         }
+     }
+ 
++    if (machine->firmware) {
++      qemu_log("overriding secure boot ROM (file: %s)\n",machine->firmware);
++      /* reset_vector */
++      FILE *bootloader_file;
++      long bootloader_size;
++      char *bootloader_bytes;
++
++      bootloader_file = fopen ( machine->firmware, "rb" );
++      if( !bootloader_file ) perror("Failed to open the bootloader file."),exit(1);
++
++      fseek( bootloader_file , 0L , SEEK_END);
++      bootloader_size = ftell( bootloader_file );
++      rewind( bootloader_file );
++
++      bootloader_bytes = (char*)malloc(bootloader_size * sizeof(char));
++      if( !bootloader_bytes ) fclose(bootloader_file),fputs("Failed to allocate space to read the bootloader file.",stderr),exit(1);
++
++      if( 1!=fread( bootloader_bytes , bootloader_size, 1 , bootloader_file) )
++        fclose(bootloader_file),free(bootloader_bytes),fputs("Failed to read entire bootloader file.",stderr),exit(1);
++
++      fclose(bootloader_file);
++
++      qemu_log("boot ROM size: %ld\n", bootloader_size);
++      /* copy in the reset vector */
++      rom_add_blob_fixed_as("mrom.reset", bootloader_bytes, bootloader_size,
++		            memmap[VIRT_MROM].base, &address_space_memory);
++
++			/* copy in the device tree */
++			/* copy in the device tree */
++			if (fdt_pack(s->fdt) || fdt_totalsize(s->fdt) >
++					memmap[VIRT_MROM].size - bootloader_size) {
++				error_report("not enough space to store device-tree");
++				exit(1);
++			}
++			qemu_fdt_dumpdtb(s->fdt, fdt_totalsize(s->fdt));
++			rom_add_blob_fixed_as("mrom.fdt", s->fdt, fdt_totalsize(s->fdt),
++					memmap[VIRT_MROM].base + bootloader_size,
++					&address_space_memory);
++			
++			qemu_log("fdt dumped at %ld\n", memmap[VIRT_MROM].base + bootloader_size);
++
++      free(bootloader_bytes);
++    } else {
++
+     /* reset vector */
+     uint32_t reset_vec[8] = {
+         0x00000297,                  /* 1:  auipc  t0, %pcrel_hi(dtb) */
+@@ -446,6 +490,7 @@ static void riscv_virt_board_init(MachineState *machine)
+     }
+     rom_add_blob_fixed_as("mrom.reset", reset_vec, sizeof(reset_vec),
+                           memmap[VIRT_MROM].base, &address_space_memory);
++    
+ 
+     /* copy in the device tree */
+     if (fdt_pack(s->fdt) || fdt_totalsize(s->fdt) >
+@@ -457,6 +502,8 @@ static void riscv_virt_board_init(MachineState *machine)
+     rom_add_blob_fixed_as("mrom.fdt", s->fdt, fdt_totalsize(s->fdt),
+                           memmap[VIRT_MROM].base + sizeof(reset_vec),
+                           &address_space_memory);
++    
++    }
+ 
+     /* create PLIC hart topology configuration string */
+     plic_hart_config_len = (strlen(VIRT_PLIC_HART_CONFIG) + 1) * smp_cpus;
+Submodule roms/seabios contains untracked content
+diff --git a/qemu/target/riscv/pmp.c b/qemu/target/riscv/pmp.c
+index 958c7502a0..7a9fd415ba 100644
+--- a/qemu/target/riscv/pmp.c
++++ b/qemu/target/riscv/pmp.c
+@@ -232,6 +232,7 @@ bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
+ {
+     int i = 0;
+     int ret = -1;
++    int pmp_size = 0;
+     target_ulong s = 0;
+     target_ulong e = 0;
+     pmp_priv_t allowed_privs = 0;
+@@ -241,11 +242,21 @@ bool pmp_hart_has_privs(CPURISCVState *env, target_ulong addr,
+         return true;
+     }
+ 
++    /*
++     * if size is unknown (0), assume that all bytes
++     * from addr to the end of the page will be accessed.
++     */
++    if (size == 0) {
++        pmp_size = -(addr | TARGET_PAGE_MASK);
++    } else {
++        pmp_size = size;
++    }
++
+     /* 1.10 draft priv spec states there is an implicit order
+          from low to high */
+     for (i = 0; i < MAX_RISCV_PMPS; i++) {
+         s = pmp_is_in_range(env, i, addr);
+-        e = pmp_is_in_range(env, i, addr + size - 1);
++        e = pmp_is_in_range(env, i, addr + pmp_size - 1);
+ 
+         /* partially inside */
+         if ((s + e) == 1) {
+Submodule riscv-pk contains untracked content
+Submodule riscv-pk contains modified content
+diff --git a/riscv-pk/bbl/bbl.lds b/riscv-pk/bbl/bbl.lds
+index aa5f68f..cb801f8 100644
+--- a/riscv-pk/bbl/bbl.lds
++++ b/riscv-pk/bbl/bbl.lds
+@@ -82,6 +82,7 @@ SECTIONS
+ 
+   /* bss: Uninitialized writeable data section */
+   . = .;
++  . = ALIGN(8);
+   _bss_start = .;
+   .bss :
+   {
+@@ -91,6 +92,8 @@ SECTIONS
+     *(.gnu.linkonce.b.*)
+     *(COMMON)
+   }
++  . = ALIGN(8);
++  _bss_end = .;
+ 
+   .sbi :
+   {
+diff --git a/riscv-pk/machine/atomic.h b/riscv-pk/machine/atomic.h
+index fe81566..eca7824 100644
+--- a/riscv-pk/machine/atomic.h
++++ b/riscv-pk/machine/atomic.h
+@@ -17,18 +17,23 @@ typedef struct { int lock; } spinlock_t;
+ #define atomic_set(ptr, val) (*(volatile typeof(*(ptr)) *)(ptr) = val)
+ #define atomic_read(ptr) (*(volatile typeof(*(ptr)) *)(ptr))
+ 
++static spinlock_t atomic_binop_lock = SPINLOCK_INIT;
++
++#define atomic_binop(ptr, inc, op) ({ \
++ long flags = disable_irqsave(); \
++ spinlock_lock(&atomic_binop_lock); \
++ typeof(*(ptr)) res = atomic_read(ptr); \
++ atomic_set(ptr, op); \
++ spinlock_unlock(&atomic_binop_lock); \
++ enable_irqrestore(flags); \
++ res; })
++
+ #ifdef __riscv_atomic
+ # define atomic_add(ptr, inc) __sync_fetch_and_add(ptr, inc)
+ # define atomic_or(ptr, inc) __sync_fetch_and_or(ptr, inc)
+ # define atomic_swap(ptr, swp) __sync_lock_test_and_set(ptr, swp)
+ # define atomic_cas(ptr, cmp, swp) __sync_val_compare_and_swap(ptr, cmp, swp)
+ #else
+-# define atomic_binop(ptr, inc, op) ({ \
+-  long flags = disable_irqsave(); \
+-  typeof(*(ptr)) res = atomic_read(ptr); \
+-  atomic_set(ptr, op); \
+-  enable_irqrestore(flags); \
+-  res; })
+ # define atomic_add(ptr, inc) atomic_binop(ptr, inc, res + (inc))
+ # define atomic_or(ptr, inc) atomic_binop(ptr, inc, res | (inc))
+ # define atomic_swap(ptr, inc) atomic_binop(ptr, inc, (inc))
+diff --git a/riscv-pk/machine/mentry.S b/riscv-pk/machine/mentry.S
+index ad99c42..b1cea2a 100644
+--- a/riscv-pk/machine/mentry.S
++++ b/riscv-pk/machine/mentry.S
+@@ -3,6 +3,8 @@
+ #include "mtrap.h"
+ #include "bits.h"
+ #include "config.h"
++.weak _bss_end
++
+   .data
+   .align 6
+ trap_table:
+@@ -282,6 +284,15 @@ do_reset:
+   slli a2, a3, RISCV_PGSHIFT
+   add sp, sp, a2
+ 
++  # clear .bss section
++  la t0, _bss_start
++  la t1, _bss_end
++.Lbss_clear_init:
++  beq t0, t1, .Lbss_clear_end
++  sd zero, 0(t0)
++  addi t0, t0, 8
++  j .Lbss_clear_init
++.Lbss_clear_end:
+   # Boot on the first hart
+   beqz a3, init_first_hart
+ 
+diff --git a/riscv-pk/machine/mtrap.c b/riscv-pk/machine/mtrap.c
+index a3b955a..40a74cd 100644
+--- a/riscv-pk/machine/mtrap.c
++++ b/riscv-pk/machine/mtrap.c
+@@ -59,7 +59,7 @@ void printm(const char* s, ...)
+ static void send_ipi(uintptr_t recipient, int event)
+ {
+   if (((disabled_hart_mask >> recipient) & 1)) return;
+-  atomic_or(&OTHER_HLS(recipient)->mipi_pending, event);
++  atomic_binop(&OTHER_HLS(recipient)->mipi_pending, even, res | event);
+   mb();
+   *OTHER_HLS(recipient)->ipi = 1;
+ }
+@@ -115,7 +115,7 @@ static void send_ipi_many(uintptr_t* pmask, int event)
+   for (uintptr_t i = 0, m = mask; m; i++, m >>= 1)
+     if (m & 1)
+       while (*OTHER_HLS(i)->ipi)
+-        incoming_ipi |= atomic_swap(HLS()->ipi, 0);
++        incoming_ipi |= atomic_binop(HLS()->ipi, 0, (0));
+ 
+   // if we got an IPI, restore it; it will be taken after returning
+   if (incoming_ipi) {
+@@ -268,6 +268,15 @@ send_ipi:
+     case SBI_SM_RANDOM:
+       retval = mcall_sm_random();
+       break;
++    case SBI_SM_CON_ENCLAVES:
++      retval = mcall_sm_connect_enclaves(arg0, arg1);
++      break;
++    case SBI_SM_SYNC_DISCON_ENCLAVES:
++      retval = mcall_sm_sync_disconnect_enclaves(arg0, arg1);
++      break;
++    case SBI_SM_ASYNC_DISCON_ENCLAVES:
++      retval = mcall_sm_async_disconnect_enclaves(arg0, arg1);
++      break;
+     case SBI_SM_CALL_PLUGIN:
+       retval = mcall_sm_call_plugin(arg0, arg1, arg2, arg3);
+       break;
+diff --git a/riscv-pk/machine/uart16550.c b/riscv-pk/machine/uart16550.c
+index fe1ba99..25361cc 100644
+--- a/riscv-pk/machine/uart16550.c
++++ b/riscv-pk/machine/uart16550.c
+@@ -2,7 +2,8 @@
+ #include "uart16550.h"
+ #include "fdt.h"
+ 
+-volatile uint8_t* uart16550;
++volatile uint32_t* uart16550;
++// volatile uint8_t* uart16550;
+ 
+ #define UART_REG_QUEUE     0
+ #define UART_REG_LINESTAT  5
+@@ -37,7 +38,8 @@ static void uart16550_open(const struct fdt_scan_node *node, void *extra)
+ static void uart16550_prop(const struct fdt_scan_prop *prop, void *extra)
+ {
+   struct uart16550_scan *scan = (struct uart16550_scan *)extra;
+-  if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "ns16550a")) {
++  if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "ns16750")) {
++  // if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "ns16550a")) {
+     scan->compat = 1;
+   } else if (!strcmp(prop->name, "reg")) {
+     fdt_get_address(prop->node->parent, prop->value, &scan->reg);
+@@ -53,7 +55,8 @@ static void uart16550_done(const struct fdt_scan_node *node, void *extra)
+   // http://wiki.osdev.org/Serial_Ports
+   uart16550[1] = 0x00;    // Disable all interrupts
+   uart16550[3] = 0x80;    // Enable DLAB (set baud rate divisor)
+-  uart16550[0] = 0x03;    // Set divisor to 3 (lo byte) 38400 baud
++  uart16550[0] = 0x1b;    // Set divisor to 3 (lo byte) 38400 baud
++  // uart16550[0] = 0x03;    // Set divisor to 3 (lo byte) 38400 baud
+   uart16550[1] = 0x00;    //                  (hi byte)
+   uart16550[3] = 0x03;    // 8 bits, no parity, one stop bit
+   uart16550[2] = 0xC7;    // Enable FIFO, clear them, with 14-byte threshold
+diff --git a/riscv-pk/machine/uart16550.h b/riscv-pk/machine/uart16550.h
+index d7a0805..68f1a01 100644
+--- a/riscv-pk/machine/uart16550.h
++++ b/riscv-pk/machine/uart16550.h
+@@ -3,7 +3,8 @@
+ 
+ #include <stdint.h>
+ 
+-extern volatile uint8_t* uart16550;
++extern volatile uint32_t* uart16550;
++// extern volatile uint8_t* uart16550;
+ 
+ void uart16550_putchar(uint8_t ch);
+ int uart16550_getchar();
+diff --git a/riscv-pk/pk/pk.lds b/riscv-pk/pk/pk.lds
+index 999dc5e..9e1cf9c 100644
+--- a/riscv-pk/pk/pk.lds
++++ b/riscv-pk/pk/pk.lds
+@@ -171,6 +171,7 @@ _ftext = .;
+ 
+   /* bss: Uninitialized writeable data section */
+   . = .;
++  . = ALIGN(8);
+   _bss_start = .;
+   .bss : 
+   {
+@@ -180,6 +181,8 @@ _ftext = .;
+     *(.gnu.linkonce.b.*)
+     *(COMMON)
+   }
++  . = ALIGN(8);
++  _bss_end = .;
+ 
+   _end = .;
+ }
+diff --git a/riscv-pk/sm/attest.c b/riscv-pk/sm/attest.c
+index a2116e3..487be62 100644
+--- a/riscv-pk/sm/attest.c
++++ b/riscv-pk/sm/attest.c
+@@ -20,13 +20,16 @@ int validate_and_hash_epm(hash_ctx* hash_ctx, int level,
+   //TODO check for failures
+   uintptr_t epm_start, epm_size;
+   uintptr_t utm_start, utm_size;
++  uintptr_t sem_start, sem_size;
+   int idx = get_enclave_region_index(encl->eid, REGION_EPM);
+   epm_start = pmp_region_get_addr(encl->regions[idx].pmp_rid);
+   epm_size = pmp_region_get_size(encl->regions[idx].pmp_rid);
+   idx = get_enclave_region_index(encl->eid, REGION_UTM);
+   utm_start = pmp_region_get_addr(encl->regions[idx].pmp_rid);
+   utm_size = pmp_region_get_size(encl->regions[idx].pmp_rid);
+-
++  idx = get_enclave_region_index(encl->eid, REGION_SEM);
++  sem_start = pmp_region_get_addr(encl->regions[idx].pmp_rid);
++  sem_size = pmp_region_get_size(encl->regions[idx].pmp_rid);
+ 
+ 
+   /* iterate over PTEs */
+@@ -44,9 +47,11 @@ int validate_and_hash_epm(hash_ctx* hash_ctx, int level,
+                       phys_addr < epm_start + epm_size);
+     int map_in_utm = (phys_addr >= utm_start &&
+                       phys_addr < utm_start + utm_size);
++    int map_in_sem = (phys_addr >= sem_start &&
++                      phys_addr < sem_start + sem_size);
+ 
+     /* EPM may map anything, UTM may not map pgtables */
+-    if(!map_in_epm && (!map_in_utm || level != 1)){
++    if(!map_in_epm && (!map_in_utm || level != 1) && (!map_in_sem || level != 1)){
+       goto fatal_bail;
+     }
+ 
+@@ -101,6 +106,13 @@ int validate_and_hash_epm(hash_ctx* hash_ctx, int level,
+         goto fatal_bail;
+       }
+ 
++      /* If the vaddr is in SEN, the paddr must be in SEM */
++      if(va_start >= encl->params.shared_entry &&
++         va_start < (encl->params.shared_entry + encl->params.shared_size) &&
++         !map_in_sem){
++        goto fatal_bail;
++      }
++
+       /* Do linear mapping validation */
+       if(in_runtime){
+         if(phys_addr <= *runtime_max_seen){
+@@ -118,7 +130,7 @@ int validate_and_hash_epm(hash_ctx* hash_ctx, int level,
+           *user_max_seen = phys_addr;
+         }
+       }
+-      else if(map_in_utm){
++      else if(map_in_utm || map_in_sem){
+         // we checked this above, its OK
+       }
+       else{
+@@ -177,6 +189,8 @@ enclave_ret_code validate_and_hash_enclave(struct enclave* enclave){
+   // hash the runtime parameters
+   hash_extend(&hash_ctx, &enclave->params, sizeof(struct runtime_va_params_t));
+ 
++  // hash the list of connected enclaves
++  hash_extend(&hash_ctx, &enclave->connector[0], sizeof(struct shared_mem_connector));
+ 
+   uintptr_t runtime_max_seen=0;
+   uintptr_t user_max_seen=0;;
+diff --git a/riscv-pk/sm/enclave.c b/riscv-pk/sm/enclave.c
+index 27bbb89..006faa0 100644
+--- a/riscv-pk/sm/enclave.c
++++ b/riscv-pk/sm/enclave.c
+@@ -68,6 +68,20 @@ static inline enclave_ret_code context_switch_to_enclave(uintptr_t* regs,
+     // $a7: (size_t) utm size
+     regs[17] = (uintptr_t) enclaves[eid].params.untrusted_size;
+ 
++    // HACK:
++    // $t3: (PA) sem base
++    regs[28] = (uintptr_t) enclaves[eid].pa_params.sem_base;
++    // $t4: (PA) sem size
++    regs[29] = (uintptr_t) enclaves[eid].pa_params.sem_size;
++    // $t5: (VA) sem_vaddr
++    regs[30] = (uintptr_t) enclaves[eid].params.shared_entry;
++    // $s9: (PA) sem_connector_base
++    regs[25] = (uintptr_t) enclaves[eid].connector[0].paddr;
++    // $s10: (PA) sem_connector_base
++    regs[26] = (uintptr_t) enclaves[eid].connector[0].size;
++    // $s11: (PA) sem_connector_base
++    regs[27] = (uintptr_t) enclaves[eid].connector[0].vaddr;
++
+     // switch to the initial enclave page table
+     write_csr(satp, enclaves[eid].encl_satp);
+   }
+@@ -331,14 +345,20 @@ static int is_create_args_valid(struct keystone_sbi_create* args)
+ {
+   uintptr_t epm_start, epm_end;
+ 
+-  /* printm("[create args info]: \r\n\tepm_addr: %llx\r\n\tepmsize: %llx\r\n\tutm_addr: %llx\r\n\tutmsize: %llx\r\n\truntime_addr: %llx\r\n\tuser_addr: %llx\r\n\tfree_addr: %llx\r\n", */
+-  /*        args->epm_region.paddr, */
+-  /*        args->epm_region.size, */
+-  /*        args->utm_region.paddr, */
+-  /*        args->utm_region.size, */
+-  /*        args->runtime_paddr, */
+-  /*        args->user_paddr, */
+-  /*        args->free_paddr); */
++  // printm("[create args info]: \r\n");
++  // printm("\tepm_addr:     %llx\r\n", args->epm_region.paddr);
++  // printm("\tepmsize:      %llx\r\n", args->epm_region.size);
++  // printm("\tutm_addr:     %llx\r\n", args->utm_region.paddr);
++  // printm("\tutmsize:      %llx\r\n", args->utm_region.size);
++  // printm("\tsem_addr:     %llx\r\n", args->sem_region.paddr);
++  // printm("\tsemsize:      %llx\r\n", args->sem_region.size);
++  // printm("\truntime_addr: %llx\r\n", args->runtime_paddr);
++  // printm("\tuser_addr:    %llx\r\n", args->user_paddr);
++  // printm("\tfree_addr:    %llx\r\n", args->free_paddr);
++  // printm("\trt_entry:     %llx\r\n", args->params.runtime_entry);
++  // printm("\tuser_entry:   %llx\r\n", args->params.user_entry);
++  // printm("\tutm_vaddr:    %llx\r\n", args->params.untrusted_ptr);
++  // printm("\tsem_vaddr:    %llx\r\n", args->params.shared_entry);
+ 
+   // check if physical addresses are valid
+   if (args->epm_region.size <= 0)
+@@ -351,6 +371,9 @@ static int is_create_args_valid(struct keystone_sbi_create* args)
+   if (args->utm_region.paddr >=
+       args->utm_region.paddr + args->utm_region.size)
+     return 0;
++  if (args->sem_region.paddr >=
++      args->sem_region.paddr + args->sem_region.size)
++    return 0;
+ 
+   epm_start = args->epm_region.paddr;
+   epm_end = args->epm_region.paddr + args->epm_region.size;
+@@ -396,12 +419,14 @@ enclave_ret_code create_enclave(struct keystone_sbi_create create_args)
+   size_t size = create_args.epm_region.size;
+   uintptr_t utbase = create_args.utm_region.paddr;
+   size_t utsize = create_args.utm_region.size;
++  uintptr_t sembase = create_args.sem_region.paddr;
++  size_t semsize = create_args.sem_region.size;
+   enclave_id* eidptr = create_args.eid_pptr;
+ 
+   uint8_t perm = 0;
+   enclave_id eid;
+   enclave_ret_code ret;
+-  int region, shared_region;
++  int region, shared_region, sem_region;
+   int i;
+   int region_overlap = 0;
+ 
+@@ -417,7 +442,8 @@ enclave_ret_code create_enclave(struct keystone_sbi_create create_args)
+   pa_params.runtime_base = create_args.runtime_paddr;
+   pa_params.user_base = create_args.user_paddr;
+   pa_params.free_base = create_args.free_paddr;
+-
++  pa_params.sem_base = create_args.sem_region.paddr;
++  pa_params.sem_size = create_args.sem_region.size;
+ 
+   // allocate eid
+   ret = ENCLAVE_NO_FREE_RESOURCE;
+@@ -429,6 +455,10 @@ enclave_ret_code create_enclave(struct keystone_sbi_create create_args)
+   if(pmp_region_init_atomic(base, size, PMP_PRI_ANY, &region, 0))
+     goto free_encl_idx;
+ 
++  // create a PMP region for shared enclave memory
++  if(pmp_region_init_atomic(sembase, semsize, PMP_PRI_ANY, &sem_region, 0))
++    goto free_encl_idx;
++
+   // create PMP region for shared memory
+   if(pmp_region_init_atomic(utbase, utsize, PMP_PRI_BOTTOM, &shared_region, 0))
+     goto free_region;
+@@ -439,6 +469,7 @@ enclave_ret_code create_enclave(struct keystone_sbi_create create_args)
+ 
+   // cleanup some memory regions for sanity See issue #38
+   clean_enclave_memory(utbase, utsize);
++  clean_enclave_memory(sembase, semsize);
+ 
+ 
+   // initialize enclave metadata
+@@ -448,6 +479,14 @@ enclave_ret_code create_enclave(struct keystone_sbi_create create_args)
+   enclaves[eid].regions[0].type = REGION_EPM;
+   enclaves[eid].regions[1].pmp_rid = shared_region;
+   enclaves[eid].regions[1].type = REGION_UTM;
++  enclaves[eid].regions[2].pmp_rid = sem_region;
++  enclaves[eid].regions[2].type = REGION_SEM;
++
++  enclaves[eid].regions_shared[0] = 0;
++  enclaves[eid].regions_shared[1] = 0;
++  enclaves[eid].regions_shared[2] = 0;
++
++  enclaves[eid].connector[0].valid = FALSE;
+ 
+   enclaves[eid].encl_satp = ((base >> RISCV_PGSHIFT) | SATP_MODE_CHOICE);
+   enclaves[eid].n_thread = 0;
+@@ -491,6 +530,135 @@ error:
+   return ret;
+ }
+ 
++/* Connect the shared memory of two enclaves
++ * Use the already allocated shared memory of enclave1 and map it 
++ * into enclave 2
++ * 
++ * Note: this only works with rather static enclave configurations
++ * SEM must be at enclaves[eid1].regions[2]
++ * enclaves[eid2].connector[0] must be invalid
++ */
++enclave_ret_code connect_enclaves(enclave_id eid1, enclave_id eid2)
++{
++  spinlock_lock(&encl_lock);
++
++  if(!ENCLAVE_EXISTS(eid1) || !ENCLAVE_EXISTS(eid2)) {
++    printm("invalid id\r\n");
++    return ENCLAVE_INVALID_ID;
++  }
++
++  if(enclaves[eid1].regions[2].type != REGION_SEM) {
++    printm("region sem\r\n");
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid2].connector[0].valid == TRUE) {
++    printm("not valid\r\n");
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid1].regions_shared[2] > 0) {
++    printm("mulitple shares\r\n");
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++
++  enclaves[eid2].connector[0].paddr = enclaves[eid1].pa_params.sem_base;
++  enclaves[eid2].connector[0].size = enclaves[eid1].pa_params.sem_size;
++  enclaves[eid2].connector[0].vaddr = enclaves[eid1].params.shared_entry;
++  enclaves[eid2].connector[0].valid = TRUE;
++  enclaves[eid2].regions[3] = enclaves[eid1].regions[2];
++  enclaves[eid2].regions[3].type = REGION_CON;
++  enclaves[eid1].regions_shared[2]++;
++
++  // TODO: call enclave notify
++  // TODO: disable interrupts
++  spinlock_unlock(&encl_lock);
++
++  printm("sucessfully connected enclaves\r\n");
++
++  return ENCLAVE_SUCCESS;
++}
++
++/* Disconnect the shared memory of two enclaves
++ * Use the already allocated shared memory of enclave1 and map it 
++ * into enclave 2
++ * 
++ * Note: this only works with rather static enclave configurations
++ * SEM must be at enclaves[eid1].regions[2]
++ * enclaves[eid2].connector[0] must be invalid
++ */
++enclave_ret_code disconnect_enclaves(enclave_id eid1, enclave_id eid2)
++{
++  spinlock_lock(&encl_lock);
++
++  if(!ENCLAVE_EXISTS(eid1) || !ENCLAVE_EXISTS(eid2)) {
++    return ENCLAVE_INVALID_ID;
++  }
++
++  if(enclaves[eid1].regions[2].type != REGION_SEM) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid2].connector[0].valid == FALSE) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid1].regions_shared[2] == 0) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid1].state == RUNNING || enclaves[eid1].state == STOPPED) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++
++  enclaves[eid2].connector[0].paddr = 0;
++  enclaves[eid2].connector[0].size = 0;
++  enclaves[eid2].connector[0].vaddr = 0;
++  enclaves[eid2].connector[0].valid = FALSE;
++
++  enclaves[eid1].regions_shared[2]--;
++
++  spinlock_unlock(&encl_lock);
++
++  // TODO: call enclave handler
++
++  return ENCLAVE_SUCCESS;
++}
++
++/* Perform async disconnect
++ * Move the shared memory to ownership of the 
++ * 
++ * Note: this only works with rather static enclave configurations
++ * SEM must be at enclaves[eid1].regions[2]
++ * enclaves[eid2].connector[0] must be invalid
++ */
++enclave_ret_code async_disconnect_enclaves(enclave_id eid1, enclave_id eid2)
++{
++  spinlock_lock(&encl_lock);
++
++  if(!ENCLAVE_EXISTS(eid1) || !ENCLAVE_EXISTS(eid2)) {
++    return ENCLAVE_INVALID_ID;
++  }
++
++  if(enclaves[eid1].regions[2].type != REGION_SEM) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid2].connector[0].valid == FALSE) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++  if(enclaves[eid1].regions_shared[2] == 0) {
++    return ENCLAVE_UNKNOWN_ERROR;
++  }
++
++  enclaves[eid2].connector[0].paddr = 0;
++  enclaves[eid2].connector[0].size = 0;
++  enclaves[eid2].connector[0].vaddr = 0;
++  enclaves[eid2].connector[0].valid = FALSE;
++
++  enclaves[eid1].regions_shared[2]--;
++
++  spinlock_unlock(&encl_lock);
++
++  // TODO: movce ownership to the other enclave
++
++  return ENCLAVE_SUCCESS;
++}
++
+ /*
+  * Fully destroys an enclave
+  * Deallocates EID, clears epm, etc
+@@ -525,7 +693,8 @@ enclave_ret_code destroy_enclave(enclave_id eid)
+   region_id rid;
+   for(i = 0; i < ENCLAVE_REGIONS_MAX; i++){
+     if(enclaves[eid].regions[i].type == REGION_INVALID ||
+-       enclaves[eid].regions[i].type == REGION_UTM)
++       enclaves[eid].regions[i].type == REGION_UTM ||
++       enclaves[eid].regions[i].type == REGION_CON)
+       continue;
+     //1.a Clear all pages
+     rid = enclaves[eid].regions[i].pmp_rid;
+diff --git a/riscv-pk/sm/enclave.h b/riscv-pk/sm/enclave.h
+index 1e2e648..766a52d 100644
+--- a/riscv-pk/sm/enclave.h
++++ b/riscv-pk/sm/enclave.h
+@@ -21,6 +21,7 @@
+ 
+ #define ATTEST_DATA_MAXLEN  1024
+ #define ENCLAVE_REGIONS_MAX 8
++#define ENCLAVE_SHARED_MAX 1
+ /* TODO: does not support multithreaded enclave yet */
+ #define MAX_ENCL_THREADS 1
+ 
+@@ -51,15 +52,30 @@ enum enclave_region_type{
+   REGION_INVALID,
+   REGION_EPM,
+   REGION_UTM,
++  REGION_SEM,
++  REGION_CON,
+   REGION_OTHER,
+ };
+ 
++enum valid{
++  FALSE, TRUE
++};
++
+ struct enclave_region
+ {
+   region_id pmp_rid;
+   enum enclave_region_type type;
+ };
+ 
++struct shared_mem_connector
++{
++  uintptr_t paddr;
++  uintptr_t size;
++  uintptr_t vaddr;
++  enclave_id eid; // the connected enclave
++  enum valid valid;
++};
++
+ /* enclave metadata */
+ struct enclave
+ {
+@@ -70,10 +86,14 @@ struct enclave
+ 
+   /* Physical memory regions associate with this enclave */
+   struct enclave_region regions[ENCLAVE_REGIONS_MAX];
++  int regions_shared[ENCLAVE_REGIONS_MAX];
++
++  /* Shared enclave memory connectors */
++  struct shared_mem_connector connector[ENCLAVE_SHARED_MAX];
+ 
+   /* measurement */
+   byte hash[MDSIZE];
+-  byte sign[SIGNATURE_SIZE];
++  // byte sign[SIGNATURE_SIZE];
+ 
+   /* parameters */
+   struct runtime_va_params_t params;
+@@ -117,6 +137,10 @@ enclave_ret_code resume_enclave(uintptr_t* regs, enclave_id eid);
+ enclave_ret_code exit_enclave(uintptr_t* regs, unsigned long retval, enclave_id eid);
+ enclave_ret_code stop_enclave(uintptr_t* regs, uint64_t request, enclave_id eid);
+ enclave_ret_code attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size, enclave_id eid);
++// callable from both worlds
++enclave_ret_code connect_enclaves(enclave_id eid1, enclave_id eid2);
++enclave_ret_code disconnect_enclaves(enclave_id eid1, enclave_id eid2);
++enclave_ret_code async_disconnect_enclaves(enclave_id eid1, enclave_id eid2);
+ /* attestation and virtual mapping validation */
+ enclave_ret_code validate_and_hash_enclave(struct enclave* enclave);
+ // TODO: These functions are supposed to be internal functions.
+diff --git a/riscv-pk/sm/sm-sbi.c b/riscv-pk/sm/sm-sbi.c
+index 67e5b4b..bb84871 100644
+--- a/riscv-pk/sm/sm-sbi.c
++++ b/riscv-pk/sm/sm-sbi.c
+@@ -11,11 +11,15 @@
+ #include "platform.h"
+ #include "plugins/plugins.h"
+ 
++int print_next = 0;
++
+ uintptr_t mcall_sm_create_enclave(uintptr_t create_args)
+ {
+   struct keystone_sbi_create create_args_local;
+   enclave_ret_code ret;
+ 
++  unsigned long long time_start = read_csr(mcycle);
++
+   /* an enclave cannot call this SBI */
+   if (cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -29,6 +33,9 @@ uintptr_t mcall_sm_create_enclave(uintptr_t create_args)
+     return ret;
+ 
+   ret = create_enclave(create_args_local);
++
++  unsigned long long time_end = read_csr(mcycle);
++  printm("mcall_sm_create_enclave (start: %lld, end: %lld) cycles: %lld\r\n", time_start, time_end, time_end-time_start);
+   return ret;
+ }
+ 
+@@ -36,6 +43,8 @@ uintptr_t mcall_sm_destroy_enclave(unsigned long eid)
+ {
+   enclave_ret_code ret;
+ 
++  printm("mcall_sm_destroy_enclave\r\n");
++
+   /* an enclave cannot call this SBI */
+   if (cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -48,6 +57,8 @@ uintptr_t mcall_sm_run_enclave(uintptr_t* regs, unsigned long eid)
+ {
+   enclave_ret_code ret;
+ 
++  unsigned long long time_start = read_csr(mcycle);
++
+   /* an enclave cannot call this SBI */
+   if (cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -55,12 +66,21 @@ uintptr_t mcall_sm_run_enclave(uintptr_t* regs, unsigned long eid)
+ 
+   ret = run_enclave(regs, (unsigned int) eid);
+ 
++  unsigned long long time_end = read_csr(mcycle);
++  printm("mcall_sm_run_enclave (start: %lld, end: %lld) cycles: %lld\r\n", time_start, time_end, time_end-time_start);
++  print_next = 1;
+   return ret;
+ }
+ 
+ uintptr_t mcall_sm_resume_enclave(uintptr_t* host_regs, unsigned long eid)
+ {
+   enclave_ret_code ret;
++  if(print_next == 1) {
++    unsigned long long time_start = read_csr(mcycle);
++    printm("mcall_resume. current cycles: %lld\r\n", time_start);
++    print_next = 0;
++  }
++  // printm("mcall_sm_resume_enclave\n");
+ 
+   /* an enclave cannot call this SBI */
+   if (cpu_is_enclave_context()) {
+@@ -74,6 +94,9 @@ uintptr_t mcall_sm_resume_enclave(uintptr_t* host_regs, unsigned long eid)
+ uintptr_t mcall_sm_exit_enclave(uintptr_t* encl_regs, unsigned long retval)
+ {
+   enclave_ret_code ret;
++
++  printm("mcall_sm_exit_enclave\r\n");
++
+   /* only an enclave itself can call this SBI */
+   if (!cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -86,6 +109,13 @@ uintptr_t mcall_sm_exit_enclave(uintptr_t* encl_regs, unsigned long retval)
+ uintptr_t mcall_sm_stop_enclave(uintptr_t* encl_regs, unsigned long request)
+ {
+   enclave_ret_code ret;
++
++  if(print_next == 1) {
++    unsigned long long time_start = read_csr(mcycle);
++    printm("mcall_stop. current cycles: %lld\r\n", time_start);
++    print_next = 0;
++  }
++  // printm("mcall_sm_stop_enclave\n");
+   /* only an enclave itself can call this SBI */
+   if (!cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -98,6 +128,9 @@ uintptr_t mcall_sm_stop_enclave(uintptr_t* encl_regs, unsigned long request)
+ uintptr_t mcall_sm_attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size)
+ {
+   enclave_ret_code ret;
++
++  printm("mcall_sm_attest_enclave\r\n");
++
+   /* only an enclave itself can call this SBI */
+   if (!cpu_is_enclave_context()) {
+     return ENCLAVE_SBI_PROHIBITED;
+@@ -107,10 +140,53 @@ uintptr_t mcall_sm_attest_enclave(uintptr_t report, uintptr_t data, uintptr_t si
+   return ret;
+ }
+ 
++uintptr_t mcall_sm_connect_enclaves(unsigned long eid1, unsigned long eid2)
++{
++  enclave_ret_code ret;
++
++  printm("mcall_connect_enclaves\r\n");
++
++  /* an enclave cannot call this SBI */
++  if (cpu_is_enclave_context()) {
++    printm("enclave context\r\n");
++    return ENCLAVE_SBI_PROHIBITED;
++  }
++
++  ret = connect_enclaves((unsigned int) eid1, (unsigned int) eid2);
++  return ret;
++}
++
++uintptr_t mcall_sm_sync_disconnect_enclaves(unsigned long eid1, unsigned long eid2)
++{
++  enclave_ret_code ret;
++
++  /* an enclave cannot call this SBI */
++  if (cpu_is_enclave_context()) {
++    return ENCLAVE_SBI_PROHIBITED;
++  }
++
++  ret = disconnect_enclaves((unsigned int) eid1, (unsigned int) eid2);
++  return ret;
++}
++
++uintptr_t mcall_sm_async_disconnect_enclaves(unsigned long eid1, unsigned long eid2)
++{
++  enclave_ret_code ret;
++
++  /* an enclave cannot call this SBI */
++  if (cpu_is_enclave_context()) {
++    return ENCLAVE_SBI_PROHIBITED;
++  }
++
++  ret = async_disconnect_enclaves((unsigned int) eid1, (unsigned int) eid2);
++  return ret;
++}
++
+ uintptr_t mcall_sm_random()
+ {
+   /* Anyone may call this interface. */
+-
++  unsigned long long time_start = read_csr(mcycle);
++  printm("Random called. current cycles: %lld\r\n", time_start);
+   return platform_random();
+ }
+ 
+diff --git a/riscv-pk/sm/sm-sbi.h b/riscv-pk/sm/sm-sbi.h
+index 2a816fd..a3505d2 100644
+--- a/riscv-pk/sm/sm-sbi.h
++++ b/riscv-pk/sm/sm-sbi.h
+@@ -24,4 +24,8 @@ uintptr_t mcall_sm_random();
+ 
+ uintptr_t mcall_sm_call_plugin(uintptr_t plugin_id, uintptr_t call_id, uintptr_t arg0, uintptr_t arg1);
+ 
++uintptr_t mcall_sm_connect_enclaves(unsigned long eid1, unsigned long eid2);
++uintptr_t mcall_sm_sync_disconnect_enclaves(unsigned long eid1, unsigned long eid2);
++uintptr_t mcall_sm_async_disconnect_enclaves(unsigned long eid1, unsigned long eid2);
++
+ #endif
+diff --git a/riscv-pk/sm/sm.h b/riscv-pk/sm/sm.h
+index d7d49e0..11360dc 100644
+--- a/riscv-pk/sm/sm.h
++++ b/riscv-pk/sm/sm.h
+@@ -20,6 +20,9 @@
+ #define SBI_SM_STOP_ENCLAVE      106
+ #define SBI_SM_RESUME_ENCLAVE    107
+ #define SBI_SM_RANDOM            108
++#define SBI_SM_CON_ENCLAVES      109
++#define SBI_SM_SYNC_DISCON_ENCLAVES   110
++#define SBI_SM_ASYNC_DISCON_ENCLAVES  111
+ #define SBI_SM_EXIT_ENCLAVE     1101
+ #define SBI_SM_CALL_PLUGIN      1000
+ #define SBI_SM_NOT_IMPLEMENTED  1111
+@@ -74,6 +77,8 @@ struct runtime_va_params_t
+   uintptr_t user_entry;
+   uintptr_t untrusted_ptr;
+   uintptr_t untrusted_size;
++  uintptr_t shared_entry;
++  uintptr_t shared_size;
+ };
+ 
+ struct runtime_pa_params
+@@ -83,12 +88,15 @@ struct runtime_pa_params
+   uintptr_t runtime_base;
+   uintptr_t user_base;
+   uintptr_t free_base;
++  uintptr_t sem_base;
++  uintptr_t sem_size;
+ };
+ 
+ struct keystone_sbi_create
+ {
+-  struct keystone_sbi_pregion epm_region;
+-  struct keystone_sbi_pregion utm_region;
++  struct keystone_sbi_pregion epm_region; // enclave private memory
++  struct keystone_sbi_pregion utm_region; // untrusted shared memory (enclave <-> app)
++  struct keystone_sbi_pregion sem_region; // shared enclave memory (enclave <-> enclave)
+ 
+   uintptr_t runtime_paddr;
+   uintptr_t user_paddr;
+Submodule sdk contains untracked content
+Submodule sdk contains modified content
+diff --git a/sdk/examples/hello-native/eapp/eapp_native.c b/sdk/examples/hello-native/eapp/eapp_native.c
+index 0e37e5e..f630e41 100644
+--- a/sdk/examples/hello-native/eapp/eapp_native.c
++++ b/sdk/examples/hello-native/eapp/eapp_native.c
+@@ -13,8 +13,26 @@ unsigned long ocall_print_string(char* string);
+ 
+ int main(){
+ 
++  // char* utm = (char *)0xffffffff80000000;
++  // utm[0] = 'A';
++  // utm[1] = 'B';
++  // utm[2] = 'C';
++  // utm[3] = 0;
++
++  // ocall_print_string("Hello World");
++
++  // ocall_print_string(utm);
++
++  char* shared = (char *)0x200000;
++  shared[0] = 'A';
++  shared[1] = 'B';
++  shared[2] = 'C';
++  shared[3] = 0;
++
+   ocall_print_string("Hello World");
+ 
++  ocall_print_string(shared);
++
+   EAPP_RETURN(0);
+ }
+ 
+diff --git a/sdk/examples/hello-native/vault.sh b/sdk/examples/hello-native/vault.sh
+index 930b5f3..dcd0c25 100755
+--- a/sdk/examples/hello-native/vault.sh
++++ b/sdk/examples/hello-native/vault.sh
+@@ -10,7 +10,7 @@ VAULT_DIR=`dirname $0`
+ BUILD_COMMAND="make -C eapp && make -C host"
+ OUTPUT_DIR=$KEYSTONE_SDK_DIR/../buildroot_overlay/root/$NAME
+ EYRIE_DIR=$KEYSTONE_SDK_DIR/rts/eyrie
+-EYRIE_PLUGINS="freemem"
++EYRIE_PLUGINS="freemem strace_debug debug"
+ PACKAGE_FILES="eapp/eapp_native \
+                host/host_native \
+                $EYRIE_DIR/eyrie-rt"
+diff --git a/sdk/examples/hello/eapp/Makefile b/sdk/examples/hello/eapp/Makefile
+index f89c461..50d7ccb 100644
+--- a/sdk/examples/hello/eapp/Makefile
++++ b/sdk/examples/hello/eapp/Makefile
+@@ -1,4 +1,4 @@
+ CC = riscv64-unknown-linux-gnu-gcc
+ 
+ all:
+-	$(CC) -static hello.c -o hello
++	$(CC) -static -g hello.c -o hello
+diff --git a/sdk/examples/hello/vault.sh b/sdk/examples/hello/vault.sh
+index 5370c36..bda14ae 100755
+--- a/sdk/examples/hello/vault.sh
++++ b/sdk/examples/hello/vault.sh
+@@ -10,7 +10,7 @@ VAULT_DIR=`dirname $0`
+ BUILD_COMMAND="make -C eapp && make -C host"
+ OUTPUT_DIR=$KEYSTONE_SDK_DIR/../buildroot_overlay/root/$NAME
+ EYRIE_DIR=$KEYSTONE_SDK_DIR/rts/eyrie
+-EYRIE_PLUGINS="freemem untrusted_io_syscall linux_syscall env_setup"
++EYRIE_PLUGINS="freemem untrusted_io_syscall linux_syscall env_setup strace_debug debug"
+ PACKAGE_FILES="eapp/hello \
+                host/runner \
+                $EYRIE_DIR/eyrie-rt"
+diff --git a/sdk/examples/tests/test-runner.cpp b/sdk/examples/tests/test-runner.cpp
+index 6d86511..45fb6c0 100644
+--- a/sdk/examples/tests/test-runner.cpp
++++ b/sdk/examples/tests/test-runner.cpp
+@@ -62,13 +62,16 @@ int main(int argc, char** argv)
+     return 0;
+   }
+ 
++  printf("test runner\r\n");
+ 
+   int self_timing = 0;
+   int load_only = 0;
+ 
+   size_t untrusted_size = 2*1024*1024;
+   size_t freemem_size = 48*1024*1024;
++  uint64_t sem_size = 8*1024;
+   uintptr_t utm_ptr = (uintptr_t)DEFAULT_UNTRUSTED_PTR;
++  uintptr_t sem_ptr = (uintptr_t)DEFAULT_SHARED_PTR;
+ 
+   static struct option long_options[] =
+     {
+@@ -115,14 +118,17 @@ int main(int argc, char** argv)
+ 
+   params.setFreeMemSize(freemem_size);
+   params.setUntrustedMem(utm_ptr, untrusted_size);
++  params.setSharedMem(sem_ptr, sem_size);
+ 
++  printf("test runner\r\n");
++  params.print();
+ 
+   if( self_timing ){
+     asm volatile ("rdcycle %0" : "=r" (cycles1));
+   }
+ 
+   enclave.init(eapp_file, rt_file , params);
+-  enclave.measure(eapp_file, rt_file , params);
++  // enclave.measure(eapp_file, rt_file , params);
+ 
+   if( self_timing ){
+     asm volatile ("rdcycle %0" : "=r" (cycles2));
+diff --git a/sdk/lib/host/include/common.h b/sdk/lib/host/include/common.h
+index e05842d..9b93e43 100644
+--- a/sdk/lib/host/include/common.h
++++ b/sdk/lib/host/include/common.h
+@@ -14,6 +14,8 @@
+ #define KEYSTONE_DEV_PATH "/dev/keystone_enclave"
+ 
+ #define MSG(str) "[Keystone SDK] " __FILE__ ":" BOOST_STRINGIZE(__LINE__) " : " str
++// #define DEBUG(str, ...) printf(MSG(str) "\n", ##__VA_ARGS__)
++#define DEBUG(str, ...) 
+ #define ERROR(str, ...) fprintf(stderr, MSG(str) "\n", ##__VA_ARGS__)
+ #define PERROR(str) perror(MSG(str))
+ #define IS_ALIGNED(x, align) (!((x)&(align-1)))
+diff --git a/sdk/lib/host/include/keystone.h b/sdk/lib/host/include/keystone.h
+index 16c4898..aceed68 100644
+--- a/sdk/lib/host/include/keystone.h
++++ b/sdk/lib/host/include/keystone.h
+@@ -39,9 +39,12 @@ private:
+   vaddr_t runtime_stk_sz;
+   vaddr_t untrusted_size;
+   vaddr_t untrusted_start;
++  vaddr_t shared_size;
++  vaddr_t shared_start;
+   vaddr_t epm_free_list;
+   vaddr_t root_page_table;
+   vaddr_t utm_free_list;
++  vaddr_t sem_free_list;
+   vaddr_t start_addr;
+   int eid;
+   int fd;
+@@ -50,6 +53,7 @@ private:
+   OcallFunc oFuncDispatch;
+   keystone_status_t mapUntrusted(size_t size);
+   keystone_status_t loadUntrusted();
++  keystone_status_t loadShared();
+   keystone_status_t loadELF(ELFFile* file, uintptr_t* data_start);
+   keystone_status_t initStack(vaddr_t start, size_t size, bool is_rt);
+   keystone_status_t allocPage(vaddr_t va, vaddr_t *free_list, vaddr_t src, unsigned int mode);
+@@ -70,6 +74,8 @@ public:
+   keystone_status_t measure(const char* filepath, const char* runtime, Params parameters);
+   keystone_status_t destroy();
+   keystone_status_t run();
++  int getEid();
++  keystone_status_t connectEnclaves(int eid2);
+ 
+ };
+ 
+diff --git a/sdk/lib/host/include/keystone_user.h b/sdk/lib/host/include/keystone_user.h
+index 25bc8be..3c0c322 100644
+--- a/sdk/lib/host/include/keystone_user.h
++++ b/sdk/lib/host/include/keystone_user.h
+@@ -23,12 +23,17 @@
+   _IOR(KEYSTONE_IOC_MAGIC, 0x06, struct keystone_ioctl_create_enclave)
+ #define KEYSTONE_IOC_UTM_INIT \
+   _IOR(KEYSTONE_IOC_MAGIC, 0x07, struct keystone_ioctl_create_enclave)
++#define KEYSTONE_IOC_SEM_INIT \
++  _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_create_enclave)
++#define KEYSTONE_IOC_CON_ENCLAVES \
++  _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_con_enclave)
+ 
+ #define RT_NOEXEC 0
+ #define USER_NOEXEC 1
+ #define RT_FULL 2
+ #define USER_FULL 3
+ #define UTM_FULL 4
++#define SEM_FULL 5
+ 
+ #define MDSIZE 64
+ 
+@@ -37,6 +42,8 @@ struct runtime_params_t {
+   __u64 user_entry;
+   __u64 untrusted_ptr;
+   __u64 untrusted_size;
++  __u64 shared_entry;
++  __u64 shared_size;
+ };
+ 
+ struct keystone_ioctl_create_enclave {
+@@ -51,6 +58,7 @@ struct keystone_ioctl_create_enclave {
+ 
+   __u64 pt_ptr;
+   __u64 utm_free_ptr;
++  __u64 sem_free_ptr;
+ 
+   //Used for hash
+   __u64 epm_paddr;
+@@ -66,6 +74,11 @@ struct keystone_ioctl_create_enclave {
+   struct runtime_params_t params;
+ };
+ 
++struct keystone_ioctl_con_enclave {
++  __u64 eid1;
++  __u64 eid2;
++};
++
+ struct keystone_ioctl_run_enclave {
+   __u64 eid;
+   __u64 entry;
+diff --git a/sdk/lib/host/include/page.h b/sdk/lib/host/include/page.h
+index 766dc47..34527f0 100644
+--- a/sdk/lib/host/include/page.h
++++ b/sdk/lib/host/include/page.h
+@@ -99,9 +99,9 @@ static pte_t* __ept_continue_walk_create(Memory* pMemory, vaddr_t *pg_list, pte_
+ 	//Gets free page list from pg_list
+ 	unsigned long free_ppn = ppn(*pg_list);
+ 	*pte = ptd_create(free_ppn);
+-  *pg_list += PAGE_SIZE;
+-//  printf("ptd_create: ppn = %p, pte = %p, pg_list: %p\n", (void *) (free_ppn << RISCV_PGSHIFT), (void *) (*pte).pte, (void *) *pg_list);
+-  return __ept_walk_create(pMemory, pg_list, root_page_table, addr);
++  	*pg_list += PAGE_SIZE;
++	// ERROR("ptd_create: ppn = %p, pte = %p, pg_list: %p", (void *) (free_ppn << RISCV_PGSHIFT), (void *) (*pte).pte, (void *) *pg_list);
++  	return __ept_walk_create(pMemory, pg_list, root_page_table, addr);
+ }
+ 
+ static pte_t* __ept_walk_internal(Memory* pMemory, vaddr_t* pg_list, pte_t* root_page_table, vaddr_t addr, int create)
+@@ -111,13 +111,15 @@ static pte_t* __ept_walk_internal(Memory* pMemory, vaddr_t* pg_list, pte_t* root
+ 	int i;
+ 	for (i = (VA_BITS - RISCV_PGSHIFT) / RISCV_PGLEVEL_BITS - 1; i > 0; i--) {
+ 		size_t idx = pt_idx(addr, i);
+-//		printf("pg_list: %p, pt: %p\n", (void *) *pg_list, (void *) __pa(root_page_table + idx));
+-//		printf("    level %d: pt_idx %d (%lu)\n", i, (int) idx, idx);
++		// printf("pg_list: %p, pt: %p\n", (void *) *pg_list, (void *) __pa(root_page_table + idx));
++		// printf("    level %d: pt_idx %d (%lu)\n", i, (int) idx, idx);
++		// ERROR("pg_list: %p, pt: %p", (void *) *pg_list, (void *) __pa(root_page_table + idx));
++		// ERROR("    level %d: pt_idx %d (%lu)", i, (int) idx, idx);
+ 		if (!(pte_val(t[idx]) & PTE_V)){
+-      return create ? __ept_continue_walk_create(pMemory, pg_list, root_page_table, addr, &t[idx]) : 0;
+-			}
++			return create ? __ept_continue_walk_create(pMemory, pg_list, root_page_table, addr, &t[idx]) : 0;
++		}
+ 
+-			t = (pte_t *) pMemory->ReadMem((vaddr_t) pte_ppn(t[idx]) << RISCV_PGSHIFT, PAGE_SIZE);
++		t = (pte_t *) pMemory->ReadMem((vaddr_t) pte_ppn(t[idx]) << RISCV_PGSHIFT, PAGE_SIZE);
+ 	}
+ 	return &t[pt_idx(addr, 0)];
+ }
+@@ -134,11 +136,11 @@ static pte_t* __ept_walk(Memory* pMemory, vaddr_t * pg_list, pte_t* root_page_ta
+ 
+ vaddr_t epm_va_to_pa(Memory* pMemory, pte_t* root_page_table, vaddr_t addr)
+ {
+-  pte_t* pte = (pte_t *) __ept_walk(pMemory, NULL, root_page_table, addr);
+-  if(pte)
+-    return pte_ppn(*pte) << RISCV_PGSHIFT;
+-  else
+-    return 0;
++	pte_t* pte = (pte_t *) __ept_walk(pMemory, NULL, root_page_table, addr);
++	if(pte)
++		return pte_ppn(*pte) << RISCV_PGSHIFT;
++	else
++		return 0;
+ }
+ 
+ /* This function pre-allocates the required page tables so that
+diff --git a/sdk/lib/host/include/params.h b/sdk/lib/host/include/params.h
+index 2dee333..de81b98 100644
+--- a/sdk/lib/host/include/params.h
++++ b/sdk/lib/host/include/params.h
+@@ -11,8 +11,11 @@
+ #define DEFAULT_UNTRUSTED_PTR   0xffffffff80000000
+ #define DEFAULT_UNTRUSTED_SIZE  8192 // 8 KB
+ 
++#define DEFAULT_SHARED_PTR      0xffffffffa0000000
++#define DEFAULT_SHARED_SIZE     8192 // 8 KB
++
+ #define DEFAULT_STACK_SIZE      1024*16 // 16k
+-#define DEFAULT_STACK_START  0x0000000040000000
++#define DEFAULT_STACK_START     0x0000000040000000
+ /* parameters for enclave creation */
+ class Params
+ {
+@@ -22,22 +25,33 @@ class Params
+       untrusted = DEFAULT_UNTRUSTED_PTR;
+       untrusted_size = DEFAULT_UNTRUSTED_SIZE;
+       freemem_size = DEFAULT_FREEMEM_SIZE;
++      shared = DEFAULT_SHARED_PTR;
++      shared_size = DEFAULT_SHARED_SIZE;
+     }
+ 
+     void setSimulated(bool _simulated) { simulated = _simulated; }
+     void setEnclaveEntry(uint64_t) { printf("WARN: setEnclaveEntry() is deprecated.\n"); }
+     void setUntrustedMem(uint64_t ptr, uint64_t size) { untrusted = ptr; untrusted_size = size; }
++    void setSharedMem(uint64_t ptr, uint64_t size) { shared = ptr; shared_size = size; }
+     void setFreeMemSize(uint64_t size) { freemem_size = size; }
+     bool isSimulated() { return simulated; }
+     uint64_t getUntrustedMem() { return untrusted; }
+     uint64_t getUntrustedSize() { return untrusted_size; }
++    uint64_t getSharedMem() { return shared; }
++    uint64_t getSharedSize() { return shared_size; }
+     uint64_t getFreeMemSize() { return freemem_size; }
++    void print() {
++      printf("\tsem_base: %llx\r\n\tsem_size: %lld\r\n", 
++        (unsigned long long) shared, (unsigned long long) shared_size);
++    }
+   private:
+     bool simulated;
+     uint64_t runtime_entry;
+     uint64_t enclave_entry;
+     uint64_t untrusted;
+     uint64_t untrusted_size;
++    uint64_t shared;
++    uint64_t shared_size;
+     uint64_t freemem_size;
+ };
+ 
+diff --git a/sdk/lib/host/src/keystone.cpp b/sdk/lib/host/src/keystone.cpp
+index 31226c0..1cd8121 100644
+--- a/sdk/lib/host/src/keystone.cpp
++++ b/sdk/lib/host/src/keystone.cpp
+@@ -21,7 +21,8 @@ Keystone::Keystone() {
+   root_page_table = 0;
+   start_addr = 0;
+   eid = -1;
+-
++  shared_start = 0;
++  shared_size = 0;
+ }
+ 
+ Keystone::~Keystone() {
+@@ -66,9 +67,25 @@ keystone_status_t Keystone::loadUntrusted() {
+     return KEYSTONE_SUCCESS;
+ }
+ 
++keystone_status_t Keystone::loadShared() {
++    vaddr_t va_start = ROUND_DOWN(shared_start, PAGE_BITS);
++    vaddr_t va_end = ROUND_UP(shared_start + shared_size, PAGE_BITS);
++    static char nullpage[PAGE_SIZE] = {0,};
++
++    while (va_start < va_end) {
++        if (allocPage(va_start, &sem_free_list, (vaddr_t) nullpage, SEM_FULL) == KEYSTONE_ERROR){
++          PERROR("failed to add page - allocPage() failed");
++        }
++
++        va_start += PAGE_SIZE;
++    }
++    return KEYSTONE_SUCCESS;
++}
++
+ /* This function will be deprecated when we implement freemem */
+ keystone_status_t Keystone::initStack(vaddr_t start, size_t size, bool is_rt)
+ {
++  DEBUG("initStack");
+   static char nullpage[PAGE_SIZE] = {0,};
+   vaddr_t high_addr = ROUND_UP(start, PAGE_BITS);
+   vaddr_t va_start_stk = ROUND_DOWN((high_addr - size), PAGE_BITS);
+@@ -100,6 +117,9 @@ keystone_status_t Keystone::allocPage(vaddr_t va, vaddr_t *free_list, vaddr_t sr
+   page_addr = *free_list >> PAGE_BITS;
+   *free_list += PAGE_SIZE;
+ 
++  // ERROR("allocPage: va: %lx  src: %lx  pa: %lx  mode: %d pte: %p", 
++  //   va, src, page_addr << 12, mode, pte);
++
+   switch (mode) {
+     case USER_NOEXEC: {
+       *pte = pte_create(page_addr, PTE_D | PTE_A | PTE_R | PTE_W | PTE_U | PTE_V);
+@@ -124,6 +144,11 @@ keystone_status_t Keystone::allocPage(vaddr_t va, vaddr_t *free_list, vaddr_t sr
+       pMemory->WriteMem(src, (vaddr_t) page_addr << PAGE_BITS, PAGE_SIZE);
+       break;
+     }
++    case SEM_FULL: {
++      *pte = pte_create(page_addr, PTE_D | PTE_A | PTE_R | PTE_W |PTE_V);
++      pMemory->WriteMem(src, (vaddr_t) page_addr << PAGE_BITS, PAGE_SIZE);
++      break;
++    }
+     default: {
+       PERROR("failed to add page - mode is invalid");
+       return KEYSTONE_ERROR;
+@@ -136,6 +161,7 @@ keystone_status_t Keystone::allocPage(vaddr_t va, vaddr_t *free_list, vaddr_t sr
+ 
+ keystone_status_t Keystone::loadELF(ELFFile* elf, uintptr_t* data_start)
+ {
++  DEBUG("loadELF");
+   static char nullpage[PAGE_SIZE] = {0,};
+   unsigned int mode = elf->getPageMode();
+   vaddr_t va;
+@@ -212,6 +238,8 @@ keystone_status_t Keystone::validate_and_hash_enclave(struct runtime_params_t ar
+   hash_ctx_t hash_ctx;
+   int ptlevel = RISCV_PGLEVEL_TOP;
+ 
++  DEBUG("validate_and_hash_enclave");
++
+   hash_init(&hash_ctx);
+ 
+   // hash the runtime parameters
+@@ -238,6 +266,7 @@ keystone_status_t Keystone::validate_and_hash_enclave(struct runtime_params_t ar
+ 
+ bool Keystone::initFiles(const char* eapppath, const char* runtimepath)
+ {
++  DEBUG("initFiles");
+   if (runtimeFile || enclaveFile) {
+     ERROR("ELF files already initialized");
+     return false;
+@@ -274,6 +303,7 @@ bool Keystone::initFiles(const char* eapppath, const char* runtimepath)
+ 
+ bool Keystone::initDevice()
+ {
++  DEBUG("initDevice");
+   if (!params.isSimulated()) {
+     /* open device driver */
+     fd = open(KEYSTONE_DEV_PATH, O_RDWR);
+@@ -288,10 +318,13 @@ bool Keystone::initDevice()
+ bool Keystone::prepareEnclave(struct keystone_ioctl_create_enclave* enclp,
+                               uintptr_t alternate_phys_addr)
+ {
++  DEBUG("prepareEnclave");
+   enclp->params.runtime_entry = (unsigned long) runtimeFile->getEntryPoint();
+   enclp->params.user_entry = (unsigned long) enclaveFile->getEntryPoint();
+   enclp->params.untrusted_ptr = (unsigned long) params.getUntrustedMem();
+   enclp->params.untrusted_size = (unsigned long) params.getUntrustedSize();
++  enclp->params.shared_entry = (unsigned long) params.getSharedMem();
++  enclp->params.shared_size = (unsigned long) params.getSharedSize();
+ 
+   // FIXME: this will be deprecated with complete freemem support.
+   // We just add freemem size for now.
+@@ -304,6 +337,13 @@ bool Keystone::prepareEnclave(struct keystone_ioctl_create_enclave* enclp,
+   untrusted_size = params.getUntrustedSize();
+   untrusted_start = params.getUntrustedMem();
+ 
++  shared_start = params.getSharedMem();
++  shared_size = params.getSharedSize();
++
++  ERROR("params: \r\n\tsem_base: %llx (%lld Bytes)\r\n\tutm_base: %llx (%lld Bytes)\r\n", 
++        enclp->params.shared_entry, enclp->params.shared_size, 
++        enclp->params.untrusted_ptr, enclp->params.untrusted_size);
++
+   if (params.isSimulated()) {
+     eid = -1; // simulated
+     pMemory->init(0, 0);
+@@ -327,7 +367,7 @@ bool Keystone::prepareEnclave(struct keystone_ioctl_create_enclave* enclp,
+ 
+   uintptr_t starting_phys_range;
+   if(alternate_phys_addr){
+-    //printf("Switching prev. %08llx for %08lx\n",enclp->pt_ptr, alternate_phys_addr);
++    DEBUG("Switching prev. %08llx for %08lx\n",enclp->pt_ptr, alternate_phys_addr);
+     starting_phys_range = alternate_phys_addr;
+   }
+   else{
+@@ -349,7 +389,7 @@ keystone_status_t Keystone::init(const char *eapppath, const char *runtimepath,
+ keystone_status_t Keystone::init(const char *eapppath, const char *runtimepath, Params _params, uintptr_t alternate_phys_addr)
+ {
+   params = _params;
+-
++  DEBUG("keystone::init");
+   if (params.isSimulated()) {
+     pMemory = new SimulatedEnclaveMemory();
+   } else {
+@@ -415,7 +455,20 @@ keystone_status_t Keystone::init(const char *eapppath, const char *runtimepath,
+     utm_free_list = enclp.utm_free_ptr;
+   }
+ 
++  // Initialize SEM
++  int ret = ioctl(fd, KEYSTONE_IOC_SEM_INIT, &enclp);
++  if (ret) {
++    ERROR("failed to init shared enclave memory - ioctl() failed: %d", ret);
++    destroy();
++    return KEYSTONE_ERROR;
++  }
++  sem_free_list = enclp.sem_free_ptr;
++
++  // ERROR("\n\nloading untrusted virtual memory mapping\n\n");
+   loadUntrusted();
++  // ERROR("\n\nloading shared virtual memory mapping\n\n");
++  loadShared();
++  // ERROR("\n\ndone loading virtual page mappings\n\n");
+   enclp.free_paddr = (epm_free_list - start_addr) + enclp.pt_ptr;
+   if(params.isSimulated()) {
+     hash_enclave.utm_size = params.getUntrustedSize();
+@@ -453,6 +506,7 @@ keystone_status_t Keystone::init(const char *eapppath, const char *runtimepath,
+ 
+ keystone_status_t Keystone::mapUntrusted(size_t size)
+ {
++  DEBUG("mapUntrusted");
+   if (size == 0) {
+     return KEYSTONE_SUCCESS;
+   }
+@@ -470,6 +524,7 @@ keystone_status_t Keystone::mapUntrusted(size_t size)
+ 
+ keystone_status_t Keystone::destroy()
+ {
++  DEBUG("destroy");
+   /* if the enclave has ever created, we destroy it. */
+   if(eid >= 0)
+   {
+@@ -496,8 +551,37 @@ keystone_status_t Keystone::destroy()
+   return KEYSTONE_SUCCESS;
+ }
+ 
++int Keystone::getEid()
++{
++  return eid;
++}
++
++keystone_status_t Keystone::connectEnclaves(int eid2)
++{
++  DEBUG("connect");
++  int ret;
++  if (params.isSimulated()) {
++    return KEYSTONE_SUCCESS;
++  }
++
++  struct keystone_ioctl_con_enclave con;
++  con.eid1 = eid;
++  con.eid2 = eid2;
++
++  ret = ioctl(fd, KEYSTONE_IOC_CON_ENCLAVES, &con);
++
++  if (ret) {
++    ERROR("failed to run enclave - ioctl() failed: %d", ret);
++    // destroy();
++    return KEYSTONE_ERROR;
++  }
++
++  return KEYSTONE_SUCCESS;
++}
++
+ keystone_status_t Keystone::run()
+ {
++  DEBUG("run");
+   int ret;
+   if (params.isSimulated()) {
+     return KEYSTONE_SUCCESS;
+diff --git a/tests/tests/test-runner.cpp b/tests/tests/test-runner.cpp
+index 391f1fb..8202023 100644
+--- a/tests/tests/test-runner.cpp
++++ b/tests/tests/test-runner.cpp
+@@ -62,13 +62,16 @@ int main(int argc, char** argv)
+     return 0;
+   }
+ 
++  // printf("[keystone-test] start main\r\n");
+ 
+   int self_timing = 0;
+   int load_only = 0;
+ 
+   size_t untrusted_size = 2*1024*1024;
+   size_t freemem_size = 48*1024*1024;
++  uint64_t sem_size = 8*1024;
+   uintptr_t utm_ptr = (uintptr_t)DEFAULT_UNTRUSTED_PTR;
++  uintptr_t sem_ptr = (uintptr_t)DEFAULT_SHARED_PTR;
+ 
+   static struct option long_options[] =
+     {
+@@ -109,30 +112,40 @@ int main(int argc, char** argv)
+     }
+   }
+ 
++  // printf("[keystone-test] after parse options\r\n");
++  // printf("[keystone-test] untrusted size: %d\r\n", untrusted_size);
++  // printf("[keystone-test] utm_ptr: %p\r\n", utm_ptr);
++  // printf("[keystone-test] freemem size: %d\r\n", freemem_size);
++  // printf("[keystone-test] timing: %d\r\n", self_timing);
++
+   Keystone enclave;
+   Params params;
+   unsigned long cycles1,cycles2,cycles3,cycles4;
+ 
+   params.setFreeMemSize(freemem_size);
+   params.setUntrustedMem(utm_ptr, untrusted_size);
+-
++  params.setSharedMem(sem_ptr, sem_size);
+ 
+   if( self_timing ){
+     asm volatile ("rdcycle %0" : "=r" (cycles1));
+   }
+ 
++  // printf("[keystone-test] init enclave...");
+   enclave.init(eapp_file, rt_file , params);
++  // printf(" done\r\n");
+ 
+   if( self_timing ){
+     asm volatile ("rdcycle %0" : "=r" (cycles2));
+   }
+ 
++  // printf("[keystone-test] init edge\r\n");
+   edge_init(&enclave);
+-
++  
+   if( self_timing ){
+     asm volatile ("rdcycle %0" : "=r" (cycles3));
+   }
+ 
++  // printf("[keystone-test] run enclave\r\n");
+   if( !load_only )
+     enclave.run();
+ 

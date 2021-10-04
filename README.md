@@ -14,3 +14,8 @@ It will be hard to build and try the current version of the git patches within t
 ## FPGA Platform
 
 We use a GenesysII FPGA board from digilent. To run the examples in this repo which do not include any peripherals, a CVA6 image with PMPs enables should suffice. CVA6 supports PMPs starting from commit 5536dfe0180080d12074edd2d0b705738239a146. Any later version with PMPs enabled should work. To test more usecases, we added some peripheral interfaces to PMOD headers on the board. These were either connected to an SPI, UART, or GPIO peripheral on the FPGA (xilinx IP). We do not release these changes due to licencing problems.
+
+## TODO
+
+- Instructions on how to apply the patches. The fiel `keystone.patch` includes all changes in the submodules aswell. However, keystone has a weird way to checkout the eyrie runtime. Therefore the patch for eyrie is separate.
+- Explain how to build an image for CVA6. Requires some manual steps pieced together from the CVA6-sdk and keystone buildflow.
